@@ -8,3 +8,6 @@ curl_cffi
 httpx
 # real browser for logging in (Turnstile) and Cloudflare challenges; needs Google Chrome (+ xvfb on Linux)
 seleniumbase
+# Linux manual takeover: capture Xvfb and relay the user's native clicks/keys
+Pillow; sys_platform == 'linux'
+python-xlib; sys_platform == 'linux'

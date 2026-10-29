@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import config, db, hot, llm, notify, ns, price, runner, upgrade
+from . import config, db, hot, llm, login_flow, login_routes, notify, ns, price, runner, upgrade
 from .security import check_password, encrypt, make_token, verify_token
 
 app = FastAPI(title="nodeseek-hub")
@@ -28,6 +28,7 @@ def _startup():
 
 @app.on_event("shutdown")
 def _shutdown():
+    login_flow.manager.cancel()
     if runner.scheduler.running:
         runner.scheduler.shutdown(wait=False)
 
@@ -238,17 +239,22 @@ def get_settings():
 
 @app.put("/api/settings", **api)
 def put_settings(body: dict):
+    with ns.account_lock:
+        return _put_settings(body)
+
+
+def _put_settings(body: dict):
     body = {k: v for k, v in body.items() if k in ("ns", "price", "hot", "upgrade", "cleanup")}
     nsb = body.get("ns")
+    account_changed = False
     if isinstance(nsb, dict):
         for k in ("password_enc", "has_password", "logged_in_at", "has_session"):
             nsb.pop(k, None)
         password = nsb.pop("password", None)
-        old_user = config.get()["ns"]["username"]
+        old = config.get()["ns"]
         if password:
             nsb["password_enc"] = encrypt(password)
-        if password or ("username" in nsb and nsb["username"] != old_user):
-            ns.clear_session()  # account changed: next write logs in again
+        account_changed = bool(password) or any(k in nsb and nsb[k] != old[k] for k in ("username", "base"))
     merged = config._merge(config.get(), body)
     times = [merged["price"]["time"], merged["hot"]["daily_time"], merged["upgrade"]["checkin"]["time"],
              merged["cleanup"]["time"], *merged["upgrade"]["post"]["times"], *merged["upgrade"]["comment"]["times"]]
@@ -257,6 +263,9 @@ def put_settings(body: dict):
         raise HTTPException(400, f"时间格式要写成 HH:MM：{', '.join(map(str, bad))}")
     if len(merged["upgrade"]["post"]["times"]) > 4:
         raise HTTPException(400, "发帖时间最多 4 个")
+    if account_changed:
+        login_flow.manager.cancel()
+        ns.clear_session()
     config.save(body)
     runner.sync_jobs()
     return {"ok": True, "config": _public_settings()}
@@ -267,10 +276,13 @@ def ns_login():
     """Log in now with the saved account (opens a browser; takes 20-60 s)."""
     lines: list[str] = []
     try:
-        ns.Client(lambda *a: lines.append(" ".join(map(str, a)))).login()
+        ns.Client(lambda *a: lines.append(" ".join(map(str, a))), manual=False).login()
     except Exception as e:
         raise HTTPException(400, str(e))
     return {"ok": True, **ns.session_info()}
+
+
+login_routes.install(app, auth, ns.start_login)
 
 
 # ---------- frontend ----------
