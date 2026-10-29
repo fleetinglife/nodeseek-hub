@@ -58,8 +58,13 @@ export default function SettingsPage() {
     })
   useEffect(() => {
     load()
+    const onActive = (e: Event) => setLoggingIn((e as CustomEvent<boolean>).detail)
     window.addEventListener("nodeseek-login-complete", load)
-    return () => window.removeEventListener("nodeseek-login-complete", load)
+    window.addEventListener("nodeseek-login-active", onActive)
+    return () => {
+      window.removeEventListener("nodeseek-login-complete", load)
+      window.removeEventListener("nodeseek-login-active", onActive)
+    }
   }, [])
 
   if (!res || !cfg) return <Skeleton className="h-[640px] rounded-xl" />
@@ -97,9 +102,8 @@ export default function SettingsPage() {
       window.dispatchEvent(new Event("nodeseek-login-start"))
       toast.info("已开始自动登录", { description: "自动处理失败时，会弹出窗口让你完成验证。" })
     } catch (e) {
-      toast.error("登录启动失败", { description: (e as Error).message, duration: 20000 })
-    } finally {
       setLoggingIn(false)
+      toast.error("登录启动失败", { description: (e as Error).message, duration: 20000 })
     }
   }
 

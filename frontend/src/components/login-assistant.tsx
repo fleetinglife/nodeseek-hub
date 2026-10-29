@@ -85,6 +85,10 @@ export function LoginAssistant() {
     return () => { disposed = true; clearTimeout(timer); clearInterval(clock); if (previous) URL.revokeObjectURL(previous) }
   }, [open, flow.id, flow.phase])
 
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent("nodeseek-login-active", { detail: active(flow) }))
+  }, [flow.phase])
+
   async function send(action: unknown) {
     if (!flow.id || sending) return
     setSending(true)
