@@ -58,6 +58,8 @@ export default function SettingsPage() {
     })
   useEffect(() => {
     load()
+    window.addEventListener("nodeseek-login-complete", load)
+    return () => window.removeEventListener("nodeseek-login-complete", load)
   }, [])
 
   if (!res || !cfg) return <Skeleton className="h-[640px] rounded-xl" />
@@ -90,13 +92,12 @@ export default function SettingsPage() {
   async function testLogin() {
     if (dirty && !(await save())) return
     setLoggingIn(true)
-    const t = toast.loading("正在用浏览器登录 NodeSeek…", { description: "要过人机验证，一般 20–60 秒。" })
     try {
-      const r = await api.post<{ logged_in_at: string }>("/ns/login")
-      toast.success("登录成功", { id: t, description: `登录状态已保存（${r.logged_in_at}），签到和发布会直接用它。` })
-      load()
+      await api.post("/ns/login/start")
+      window.dispatchEvent(new Event("nodeseek-login-start"))
+      toast.info("已开始自动登录", { description: "自动处理失败时，会弹出窗口让你完成验证。" })
     } catch (e) {
-      toast.error("登录失败", { id: t, description: (e as Error).message, duration: 20000 })
+      toast.error("登录启动失败", { description: (e as Error).message, duration: 20000 })
     } finally {
       setLoggingIn(false)
     }
@@ -123,7 +124,7 @@ export default function SettingsPage() {
       </nav>
 
       <div className="space-y-8">
-        <Section id="s-ns" title="NodeSeek 账号" hint="签到和发布用这个账号。登录要过人机验证，由服务器上的浏览器自动完成，登录状态保存后反复使用，失效了再自动重新登录。">
+        <Section id="s-ns" title="NodeSeek 账号" hint="签到和发布用这个账号。先自动验证并登录，失败时会提示你在窗口里完成验证；成功后保存会话，失效时再重新登录。">
           <Row label="用户名">
             <Input
               value={cfg.ns.username}

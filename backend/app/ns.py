@@ -14,17 +14,19 @@ The HTML selectors below were written against the public markup and are kept in 
     ./venv/bin/python -m app.ns post 1011130    # parse one post
 """
 import json
+import hashlib
 import re
 import threading
 import sys
 import time
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
+from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests
 
-from . import config, db
+from . import config, db, login_flow
 from .security import decrypt, encrypt
 
 SEL = {
@@ -45,7 +47,7 @@ LOGIN = {
 }
 # The page also has a search box, so the username input and the 登录 button are looked up
 # inside the block that holds the password input, and tagged for the clicks/typing below.
-MARK_LOGIN_FORM = """
+MARK_LOGIN_FORM = "return (() => { " + """
 const pw = document.querySelector("input[type='password']");
 let box = pw && pw.parentElement;
 while (box && !box.querySelector("button") ) box = box.parentElement;
@@ -58,7 +60,7 @@ if (user) user.setAttribute("data-nsh", "user");
 pw.setAttribute("data-nsh", "pw");
 if (btn) btn.setAttribute("data-nsh", "submit");
 return (user ? "" : "no user ") + (btn ? "" : "no button");
-"""
+""".strip().replace("\n", " ") + " })();"
 CHALLENGE = ("just a moment", "attention required", "cf-chl", "challenge-platform")
 POST_ID = re.compile(r"/post-(\d+)")
 
@@ -75,8 +77,27 @@ class LoginError(NSError):
     pass
 
 
-NOT_LOGGED_IN = re.compile(r"未登录|请先登录|登录已过期|重新登录|not.?logged|unauthori[sz]ed|login", re.I)
-_login_lock = threading.Lock()  # one browser login at a time
+NOT_LOGGED_IN = re.compile(
+    r"未登录|请先登录|登录已过期|重新登录|not.?logged|unauthori[sz]ed|login|user[\s_]+not[\s_]+found", re.I
+)
+_login_lock = threading.RLock()  # SeleniumBase/Xvfb has process-global display state
+account_lock = threading.RLock()  # account edits and verified session commits
+
+
+def _requires_email_verification(browser) -> bool:
+    path = urlsplit(browser.get_current_url()).path.lower()
+    return "emailsignin" in path or browser.is_element_visible(
+        "input[placeholder*='验证码'], input[placeholder*='validation code' i], input[autocomplete='one-time-code']"
+    )
+
+
+EMAIL_VERIFICATION_MESSAGE = "NodeSeek 要求邮箱验证码（邮箱动态验证登录）。请先完成该账号的邮箱验证后重试；当前未保存为已登录。"
+
+# Return only state, never the token itself. cf_clearance is not this form token.
+LOGIN_CHALLENGE_STATE = "return (() => { " + """
+const fields = [...document.querySelectorAll('[name="cf-turnstile-response"]')];
+return {present: fields.length > 0, ready: fields.some(field => Boolean(field.value))};
+""".strip().replace("\n", " ") + " })();"
 
 
 def _load_session() -> dict:
@@ -88,12 +109,21 @@ def _load_session() -> dict:
 
 
 def _save_session(cookies: dict, ua: str) -> None:
-    db.set_setting("ns_session", encrypt(json.dumps({"cookies": cookies, "ua": ua, "at": config.now_str()})))
+    """Save only a session that passed the authenticated, read-only API check."""
+    db.set_setting("ns_session", encrypt(json.dumps({
+        "cookies": cookies, "ua": ua, "at": config.now_str(), "verified": True,
+    })))
+
+
+def _verified_session(s: dict) -> bool:
+    # Legacy versions saved cf_clearance/theme cookies as a successful login.
+    return s.get("verified") is True and bool(s.get("cookies"))
 
 
 def session_info() -> dict:
     s = _load_session()
-    return {"logged_in_at": s.get("at"), "has_session": bool(s.get("cookies"))}
+    verified = _verified_session(s)
+    return {"logged_in_at": s.get("at") if verified else None, "has_session": verified}
 
 
 def clear_session() -> None:
@@ -110,10 +140,11 @@ def _num(text: str) -> int:
 
 
 class Client:
-    def __init__(self, log=print):
+    def __init__(self, log=print, manual=True):
         cfg = config.get()["ns"]
         self.base = cfg["base"].rstrip("/")
         self.log = log
+        self.manual = manual
         self.auto_cf = cfg.get("auto_cf", True)
         cf = db.get_setting("cf_session", {}) or {}
         self.ua = cf.get("ua") or (
@@ -177,7 +208,7 @@ class Client:
             return False
         self.log("遇到 Cloudflare 挑战，启动浏览器处理…")
         try:
-            with SB(uc=True, headless=False, xvfb=True) as sb:
+            with _login_lock, SB(uc=True, headless=False, xvfb=True) as sb:
                 sb.uc_open_with_reconnect(url, reconnect_time=6)
                 deadline = time.time() + 40
                 while time.time() < deadline:
@@ -285,8 +316,141 @@ class Client:
         return parse_feed(r.text)
 
     # ---------- login ----------
+    def _wait_login_challenge(self, browser, timeout: float = 30, flow=None) -> None:
+        """Wait for the login form's Turnstile result after the automatic attempt."""
+        state = browser.execute_script(LOGIN_CHALLENGE_STATE)
+        if not isinstance(state, dict):
+            raise LoginError("无法读取登录表单的 Cloudflare 验证状态，未提交登录请求")
+        if not state.get("present") or state.get("ready"):
+            return
+        self.log("等待登录表单的 Cloudflare 验证完成…")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if flow:
+                flow.check()
+            if _requires_email_verification(browser):
+                raise LoginError(EMAIL_VERIFICATION_MESSAGE)
+            browser.sleep(1)
+            state = browser.execute_script(LOGIN_CHALLENGE_STATE)
+            if isinstance(state, dict) and state.get("present") and state.get("ready"):
+                return
+        raise LoginError("Cloudflare 登录表单验证未完成，未提交登录请求。请稍后重试或在同一服务器浏览器中完成人工验证。")
+
+    def _verify_login(self, cookies: dict, ua: str) -> bool:
+        """Verify the exported cookies using NodeSeek's read-only authenticated API.
+
+        A browser redirect or cf_clearance only proves that a page/challenge was loaded.
+        Checking through the HTTP client also verifies the session used by sign-in/publish.
+        Do not use request(): its challenge handler can recursively call login().
+        """
+        if not cookies:
+            return False
+        session = self._new_session(cookies)
+        try:
+            r = session.get(
+                self.base + "/api/notification/unread-count",
+                headers={"User-Agent": ua, "Accept": "application/json", "Referer": self.base + "/"},
+                timeout=8,
+            )
+            if r.status_code != 200:
+                return False
+            try:
+                data = r.json()
+            except (ValueError, TypeError):
+                return False
+            return (
+                isinstance(data, dict)
+                and data.get("success") is True
+                and "unreadCount" in data
+            )
+        finally:
+            session.close()
+
     def login(self) -> None:
-        """Log in with the account in Settings through a real browser (Turnstile), save the session."""
+        """Automation first; scheduled work can wait for the panel's manual takeover."""
+        if not self.manual:
+            return self._login_browser()
+        flow = login_flow.manager.start(self._login_browser)
+        if not flow.done.wait(780):
+            login_flow.manager.cancel(flow.id)
+            raise LoginError("登录等待超时，请在面板重新登录")
+        if flow.phase != "success":
+            raise LoginError(flow.message)
+        self._auth = None
+
+    def _automatic_login(self, sb, cfg, flow=None):
+        if flow:
+            flow.check()
+        sb.uc_open_with_reconnect(self.base + "/signIn.html", reconnect_time=6)
+        if _requires_email_verification(sb):
+            raise LoginError(EMAIL_VERIFICATION_MESSAGE)
+        sb.wait_for_element_visible(LOGIN["password"], timeout=40)
+        sb.sleep(1)
+        missing = sb.execute_script(MARK_LOGIN_FORM)
+        if missing:
+            raise LoginError("登录页结构和预期不同，需要人工检查")
+        sb.type("[data-nsh='user']", cfg["username"])
+        sb.type("[data-nsh='pw']", decrypt(cfg["password_enc"]))
+        try:
+            sb.uc_gui_click_captcha()
+        except Exception:
+            self.log("自动验证未完成，等待表单验证结果…")
+        self._wait_login_challenge(sb, flow=flow)
+        if flow:
+            flow.check()
+        sb.click("[data-nsh='submit']")
+        deadline, next_probe = time.monotonic() + 45, 0
+        while time.monotonic() < deadline:
+            if flow:
+                flow.check()
+            sb.sleep(1)
+            if _requires_email_verification(sb):
+                raise LoginError(EMAIL_VERIFICATION_MESSAGE)
+            on_login_page = "signin" in sb.get_current_url().lower()
+            if not on_login_page and time.monotonic() >= next_probe:
+                if urlsplit(sb.get_current_url()).netloc != urlsplit(self.base).netloc:
+                    raise LoginError("登录窗口离开了 NodeSeek，请重新登录")
+                cookies = {c["name"]: c["value"] for c in sb.driver.get_cookies()}
+                ua = sb.execute_script("return navigator.userAgent")
+                if self._verify_login(cookies, ua):
+                    return cookies, ua
+                next_probe = time.monotonic() + 3
+            err = sb.find_elements(LOGIN["error"])
+            if err and err[0].text.strip() and on_login_page:
+                raise LoginError("登录失败：" + err[0].text.strip()[:100])
+        raise LoginError("未取得有效的 NodeSeek 登录状态（登录接口验证未通过）。请检查账号或完成人工验证。")
+
+    def _manual_login(self, sb, flow):
+        desktop = login_flow.Desktop(sb)
+        try:
+            flow.picture(*desktop.screenshot())
+            flow.manual("自动登录未完成，请在下方窗口完成验证并点击登录；如需邮箱验证码，可在窗口中输入。")
+            self.log("自动登录未完成，请打开面板完成人工验证（10 分钟内有效）")
+            next_probe = 0
+            while True:
+                flow.check()
+                # Do not export cookies from a different origin reached by a page link.
+                current = urlsplit(sb.get_current_url())
+                expected = urlsplit(self.base)
+                if (current.scheme, current.netloc) != (expected.scheme, expected.netloc):
+                    raise LoginError("登录窗口离开了 NodeSeek，请重新登录")
+                for action in flow.take_inputs():
+                    desktop.input(action)
+                flow.picture(*desktop.screenshot())
+                if "signin" not in current.path.lower() and time.monotonic() >= next_probe:
+                    cookies = {c["name"]: c["value"] for c in sb.driver.get_cookies()}
+                    ua = sb.execute_script("return navigator.userAgent")
+                    try:
+                        if self._verify_login(cookies, ua):
+                            return cookies, ua
+                    except Exception:
+                        pass  # a transient probe failure must not close the user's window
+                    next_probe = time.monotonic() + 3
+                flow.stop.wait(0.7)
+        finally:
+            desktop.close()
+
+    def _login_browser(self, flow=None) -> None:
         cfg = config.get()["ns"]
         if not cfg.get("username") or not cfg.get("password_enc"):
             raise LoginError("没有填写 NodeSeek 账号和密码（设置 → NodeSeek 账号）")
@@ -295,61 +459,64 @@ class Client:
         except ImportError:
             raise LoginError("登录需要 seleniumbase：在 backend 里用 venv 的 pip 安装（pip install -r requirements.txt），并装好 Chrome")
         with _login_lock:
+            if flow:
+                flow.check()
+            clear_session()
+            self._auth = None
             self.log("用浏览器登录 NodeSeek…")
-            profile = str(db.DATA_DIR / "browser")  # a persistent profile, so NodeSeek remembers this device
+            # Reuse the device for this account, without inheriting another account's login.
+            account_id = hashlib.sha256((self.base + "\0" + cfg["username"]).encode()).hexdigest()[:24]
+            profile = str(db.DATA_DIR / "browser" / account_id)
             try:
-                with SB(uc=True, headless=False, xvfb=True, user_data_dir=profile) as sb:
-                    sb.uc_open_with_reconnect(self.base + "/signIn.html", reconnect_time=6)
-                    sb.wait_for_element_visible(LOGIN["password"], timeout=40)
-                    sb.sleep(1)
-                    missing = sb.execute_script(MARK_LOGIN_FORM)
-                    if missing:
-                        raise LoginError(f"登录页结构和预期不同（{missing}），需要调整 ns.py 里的 MARK_LOGIN_FORM")
-                    sb.type("[data-nsh='user']", cfg["username"])
-                    sb.type("[data-nsh='pw']", decrypt(cfg["password_enc"]))
+                with SB(uc=True, headless=False, xvfb=True, user_data_dir=profile,
+                        window_size="1280,900", xvfb_metrics="1366,1000",
+                        chromium_arg="--force-device-scale-factor=1") as sb:
                     try:
-                        sb.uc_gui_click_captcha()  # Turnstile
-                    except Exception as e:
-                        self.log("人机验证点击:", e)
-                    sb.sleep(2)
-                    sb.click("[data-nsh='submit']")
-                    ok = False
-                    for _ in range(30):
-                        sb.sleep(1)
-                        if "signIn" not in sb.get_current_url():
-                            ok = True
-                            break
-                        if sb.is_element_visible("input[placeholder*='验证码']"):
-                            raise LoginError("NodeSeek 要求邮箱验证码（新设备）。在自己电脑上用同一出口 IP 登录一次，或把这一步告诉开发者再处理。")
-                        err = sb.find_elements(LOGIN["error"])
-                        if err and err[0].text.strip():
-                            raise LoginError("登录失败：" + err[0].text.strip()[:100])
-                    if not ok:
-                        raise LoginError("30 秒内没有登录成功，可能是人机验证没通过，稍后再试")
-                    cookies = {c["name"]: c["value"] for c in sb.driver.get_cookies()}
-                    ua = sb.execute_script("return navigator.userAgent")
+                        cookies, ua = self._automatic_login(sb, cfg, flow)
+                    except login_flow.FlowStopped:
+                        raise
+                    except Exception:
+                        if not flow:
+                            raise
+                        flow.check()
+                        cookies, ua = self._manual_login(sb, flow)
             except LoginError:
+                raise
+            except login_flow.FlowStopped:
                 raise
             except SystemExit as e:  # seleniumbase exits the process when python3-tk / Chrome is missing
                 raise LoginError(f"浏览器启动失败：{e}。Linux 上需要 apt install python3-tk python3-dev xvfb，并装好 Google Chrome")
             except Exception as e:
-                raise LoginError(f"浏览器登录出错：{type(e).__name__}: {e}")
-            _save_session(cookies, ua)
-            db.set_setting("cf_session", {"cookies": {k: v for k, v in cookies.items() if k.startswith(("cf_", "__cf"))},
-                                          "ua": ua, "at": config.now_str()})
+                raise LoginError(f"浏览器登录出错：{type(e).__name__}，请重新尝试")
+            with account_lock:
+                # An account edit cancels the old browser before it can commit its session.
+                current_cfg = config.get()["ns"]
+                if any(current_cfg.get(k) != cfg.get(k) for k in ("base", "username", "password_enc")):
+                    raise LoginError("账号配置已更改，请重新登录")
+                lock = flow.lock if flow else threading.RLock()
+                with lock:
+                    if flow:
+                        flow.check()
+                        flow.phase = "verifying"
+                    _save_session(cookies, ua)
+                    db.set_setting("cf_session", {"cookies": {k: v for k, v in cookies.items() if k.startswith(("cf_", "__cf"))},
+                                                  "ua": ua, "at": config.now_str()})
             self._auth = (self._new_session(cookies), ua)
             self.log("登录成功")
-
     def _write(self, path, body, referer) -> tuple[bool, str]:
         """Call a write API; log in first if there is no session, and once more if it says we're logged out."""
-        if not _load_session().get("cookies"):
+        if not _verified_session(_load_session()):
             self.login()
         for attempt in range(2):
             code, data = self.api(path, body, referer, auth=True)
             msg = data.get("message") or json.dumps(data, ensure_ascii=False)
             logged_out = code in (401, 403) or (not data.get("success") and NOT_LOGGED_IN.search(msg))
-            if not logged_out or attempt:
+            if not logged_out:
                 return bool(data.get("success")), msg
+            clear_session()
+            self._auth = None
+            if attempt:
+                return False, msg
             self.log("登录状态失效，重新登录")
             self.login()
         return False, msg
@@ -372,6 +539,11 @@ class Client:
             {"title": title, "content": content, "category": category},
             "/new-discussion",
         )
+
+
+def start_login():
+    client = Client()
+    return login_flow.manager.start(client._login_browser).public()
 
 
 def parse_feed(xml_text: str) -> list[dict]:

@@ -20,6 +20,15 @@ export const api = {
 
 export type RunStatus = "ok" | "error" | "running"
 
+export interface LoginFlow {
+  id?: string
+  phase: "idle" | "automatic" | "needs_manual" | "verifying" | "success" | "error" | "canceled" | "expired"
+  message?: string
+  expires_at?: number | null
+  width?: number
+  height?: number
+}
+
 export interface Me {
   llm: { configured: boolean; model: string }
   has_account: boolean

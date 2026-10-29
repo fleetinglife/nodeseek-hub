@@ -9,6 +9,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { Button } from "@/components/ui/button"
 import { ConfirmProvider, useConfirm } from "@/components/confirm"
 import { LogoMark } from "@/components/logo"
+import { LoginAssistant } from "@/components/login-assistant"
 import LoginPage from "@/pages/login"
 import PricePage from "@/pages/price"
 import HotPage from "@/pages/hot"
@@ -136,6 +137,7 @@ function Shell({ onLogout }: { onLogout: () => void }) {
         </nav>
 
         <main className="min-w-0 pt-6 pb-16 lg:pt-8">
+          <LoginAssistant />
           {me && !me.llm.configured && (
             <p role="alert" className="mb-6 rounded-lg border border-warning/40 bg-warning/8 px-4 py-2.5 text-[13px]">
               还没有配置 LLM：在 <code className="font-mono">backend/.env</code> 里写上 <code className="font-mono">LLM_API_KEY</code> 后重启。价格归一、热度分析和草稿都要用到它。

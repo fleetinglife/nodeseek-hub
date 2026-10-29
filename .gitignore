@@ -11,6 +11,7 @@ venv/
 # frontend
 frontend/node_modules/
 frontend/dist/
+.npm-cache/
 
 # seleniumbase writes these next to wherever the browser was started
 **/downloaded_files/
