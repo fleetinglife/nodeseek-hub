@@ -30,8 +30,11 @@ export function LoginAssistant() {
         setFlow(next)
         const key = `${next.id}:${next.phase}`
         if (key !== seen.current) {
+          const stale = seen.current === "" && !active(next) // 刚打开页面时遇到的旧流程，不重复提示
           seen.current = key
-          if (next.phase === "needs_manual") {
+          if (stale) {
+            // 已结束的旧流程，什么都不做
+          } else if (next.phase === "needs_manual") {
             setOpen(true)
             toast.info("需要你完成登录验证", { description: "在弹出的窗口里点击验证并登录，窗口保留 10 分钟。" })
           } else if (next.phase === "success") {

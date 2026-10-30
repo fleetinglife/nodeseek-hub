@@ -40,13 +40,13 @@ export default function HotPage() {
         actions={<Segmented label="时间窗口" value={win} onChange={setWin} options={[...WINDOWS]} />}
       />
 
-      {!data ? (
+      {!data || loading ? (
         <div className="grid gap-6 lg:grid-cols-[minmax(0,7fr)_minmax(0,5fr)]">
           <Skeleton className="h-[520px] rounded-xl" />
           <Skeleton className="h-[520px] rounded-xl" />
         </div>
       ) : (
-        <div className={cn("transition-opacity", loading && "opacity-60")}>
+          <div>
           {data.snapshot?.summary && (
             <figure className="mb-8 max-w-[68ch]">
               <blockquote className="text-[17px] leading-relaxed text-pretty">{data.snapshot.summary}</blockquote>

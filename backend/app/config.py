@@ -36,7 +36,7 @@ DEFAULTS = {
         "enabled": True,
         "time": "23:00",
         "max_pages": 5,        # safety cap per night (a page is ~100 posts)
-        "lookback_days": 1,     # re-scan posts first seen in the last N days to catch "已出" edits
+        "lookback_days": 0,     # re-scan posts first seen in the last N days to catch "已出" edits
         "cold_pages": 3,        # first run ever: how many list pages to take
         "usd_rate": 6.8,
         "delay": 3,             # seconds between page / detail requests
